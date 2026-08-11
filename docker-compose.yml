@@ -1,58 +1,131 @@
+name: gemeo-digital-teg
+
+networks:
+  teg_network:
+    driver: bridge
+
+volumes:
+  influxdb_data:
+  grafana_data:
 
 services:
-
-  # 1. BROKER MQTT 
-  broker-mqtt:
-    image: eclipse-mosquitto:alpine
-    container_name: broker-mqtt
+  # ============================================================================
+  # 1. BROKER MQTT & SIMULADOR EMBARCADO (ESP32)
+  # ============================================================================
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mosquitto
+    restart: always
     ports:
       - "1883:1883"
-      - "9001:9001"
     volumes:
-      - ./infra/mosquitto/config/mosquitto.conf:/infra/mosquitto/config/mosquitto.conf
-      - ./infra/mosquitto/data:/infra/mosquitto/data
-      - ./infra/mosquitto/log:/infra/mosquitto/log
-    restart: always
+      - ./mosquitto/config/mosquitto.conf:/infra/mosquitto/config/mosquitto.conf
+    networks:
+      - teg_network
 
-  # 2. BANCO DE DADOS TIMESCALEDB
-  timescaledb:
-    image: timescale/timescaledb:latest-pg14
-    container_name: teg_timescaledb
+  esp32_simulator:
+    build: ./embed_simulator
+    container_name: esp32_simulator
+    restart: always
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=senha # Mude isso depois
-      - POSTGRES_DB=teg_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - timescaledb-storage:/var/lib/postgresql/data
-    restart: always
-
-  # 3. AGENTE DE INGESTÃO (MQTT -> DB)
-  telegraf:
-    image: telegraf:latest
-    container_name: teg_telegraf
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_TOPIC=teg/bancada/telemetria
+      - PUBLISH_INTERVAL=1.0
     depends_on:
-      - broker-mqtt
-      - timescaledb
+      - mosquitto
+    networks:
+      - teg_network
+
+  # ============================================================================
+  # 2. BANCO DE DADOS TEMPO-REAL & COLETOR TELEGRAF
+  # ============================================================================
+  influxdb:
+    image: influxdb:2.7
+    container_name: teg_influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminpassword123
+      DOCKER_INFLUXDB_INIT_ORG: teg_org
+      DOCKER_INFLUXDB_INIT_BUCKET: teg_telemetry
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: my-super-secret-admin-token
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    networks:
+      - teg_network
+
+  telegraf:
+    image: telegraf:1.28
+    container_name: teg_telegraf
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+      - mosquitto
     volumes:
       - ./infra/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
-    restart: always
+    networks:
+      - teg_network
 
-  # 4. DASHBOARD DE OBSERVABILIDADE
+  # ============================================================================
+  # 3. GÊMEO DIGITAL (ANSYS) & MODELO DE INFERÊNCIA (PYTORCH)
+  # ============================================================================
+  ansys_simulator:
+    build:
+      context: ./ansys_simulator
+      dockerfile: Dockerfile
+    container_name: teg_ansys_simulator
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+      - telegraf
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: my-super-secret-admin-token
+      INFLUX_ORG: teg_org
+      INFLUX_BUCKET_RAW: teg_telemetry
+      INFLUX_BUCKET_ANALYTICS: teg_telemetry
+      INFLUX_MEASUREMENT: esp32_telemetry
+      LUT_FILEPATH: /app/models/ansys_lut.json
+    volumes:
+      - ./ansys_simulator/models:/app/models
+    networks:
+      - teg_network
+
+  ml_inference:
+    build:
+      context: ./ml_inference
+      dockerfile: Dockerfile
+    container_name: teg_ml_inference
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: my-super-secret-admin-token
+      INFLUX_ORG: teg_org
+      INFLUX_BUCKET: teg_telemetry
+    volumes:
+      - ./ml_inference/models:/app/models
+    networks:
+      - teg_network
+
+  # ============================================================================
+  # 4. DASHBOARDS E VISUALIZAÇÃO
+  # ============================================================================
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.1.0
     container_name: teg_grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin # Senha do Grafana
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: grafanapassword
     volumes:
-      - grafana-storage:/var/lib/grafana
-    depends_on:
-      - timescaledb
-    restart: always
-
-volumes:
-  grafana-storage: {}
-  timescaledb-storage: {}
+      - grafana_data:/var/lib/grafana
+    networks:
+      - teg_network
